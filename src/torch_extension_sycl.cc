@@ -110,6 +110,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+#ifdef BUILD_FMHA  
   /*
    * From cutlass attention
    */
@@ -143,7 +144,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
-
+#endif
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
   m.def(
@@ -231,9 +232,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
 
-  /* HC PRE GEMM */
-  m.def("hc_pre_gemm(Tensor A, Tensor B, Tensor! C) -> ()");
-  m.impl("hc_pre_gemm", torch::kXPU, &hc_pre_gemm);
+  /* HC PRE GEMM SQRSUM */
+  m.def("hc_pre_gemm_sqrsum(Tensor A, Tensor B, Tensor! C, Tensor! sqrsum) -> ()");
+  m.impl("hc_pre_gemm_sqrsum", torch::kXPU, &hc_pre_gemm_sqrsum);
 }
 
 REGISTER_EXTENSION(common_ops)

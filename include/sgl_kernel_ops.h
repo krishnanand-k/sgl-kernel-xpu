@@ -661,4 +661,8 @@ void embedding_lora_a_fwd(
 /*
  * From csrc/mhc_gemm
  */
-void hc_pre_gemm(const at::Tensor& A, const at::Tensor& B, at::Tensor& C);
+void hc_pre_gemm_sqrsum(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    at::Tensor& sqrsum);

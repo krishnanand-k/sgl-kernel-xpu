@@ -149,11 +149,14 @@ def hc_pre_big_fuse(
     )
 
 
-def hc_pre_gemm(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor):
+def hc_pre_gemm_sqrsum(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, sqrsum: torch.Tensor
+):
     """
-    HC Pre GEMM: C = A @ B
+    HC Pre GEMM with SqrSum: C = A @ B AND sqrsum = sum(C[t, :]^2) per row
     A: [T, K] bfloat16, row-major
     B: [K, N] float32, column-major
     C: [T, N] float32, row-major (output)
+    sqrsum: [T] float32 (output) - sum of squares per row
     """
-    torch.ops.sgl_kernel.hc_pre_gemm.default(A, B, C)
+    torch.ops.sgl_kernel.hc_pre_gemm_sqrsum.default(A, B, C, sqrsum)

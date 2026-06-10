@@ -37,26 +37,29 @@ limitations under the License.
 
 using namespace cute;
 
-// HC Pre GEMM: C[T, N] = A[T, K] @ B[K, N]
+// HC Pre GEMM with SqrSum: C[T, N] = A[T, K] @ B[K, N] AND sqrsum[T] = sum(C[t, :]^2)
 // A: bfloat16, row-major
 // B: float32, column-major
 // C: float32, row-major
+// sqrsum: float32
 //
 // Based on CUTLASS example: examples/00_bmg_gemm/00_bmg_gemm.cpp
 // Configuration from mhc_guide.md: TileShape<64, 32, 128>
-
-void hc_pre_gemm(
-    const at::Tensor& A,  // [T, K] bfloat16
-    const at::Tensor& B,  // [K, N] float32, column-major
-    at::Tensor& C) {      // [T, N] float32
+void hc_pre_gemm_sqrsum(
+    const at::Tensor& A,       // [T, K] bfloat16
+    const at::Tensor& B,       // [K, N] float32, column-major
+    at::Tensor& C,             // [T, N] float32 (output)
+    at::Tensor& sqrsum) {      // [T] float32 (output)
 
   CHECK_INPUT(A);
   CHECK_DEVICE(B);  // B can be non-contiguous (column-major)
   CHECK_INPUT(C);
+  CHECK_INPUT(sqrsum);
 
   TORCH_CHECK(A.scalar_type() == at::kBFloat16, "A must be bfloat16");
   TORCH_CHECK(B.scalar_type() == at::kFloat, "B must be float32");
   TORCH_CHECK(C.scalar_type() == at::kFloat, "C must be float32");
+  TORCH_CHECK(sqrsum.scalar_type() == at::kFloat, "sqrsum must be float32");
 
   const int64_t T = A.size(0);
   const int64_t K_A = A.size(1);
@@ -75,8 +78,18 @@ void hc_pre_gemm(
       ", ",
       C.size(1),
       "]");
+  TORCH_CHECK(
+      sqrsum.size(0) == T,
+      "sqrsum dimension mismatch: expected [",
+      T,
+      "], got [",
+      sqrsum.size(0),
+      "]");
 
-  // CUTLASS GEMM configuration
+  // Initialize sqrsum to zero
+  sqrsum.fill_(0.0f);
+
+  // CUTLASS GEMM configuration (same as hc_pre_gemm)
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
   using ElementInputA = cutlass::bfloat16_t;
@@ -84,19 +97,15 @@ void hc_pre_gemm(
   using ElementOutput = float;
 
   using LayoutA = cutlass::layout::RowMajor;     // A: row-major
-  using LayoutB = cutlass::layout::ColumnMajor;  // B: column-major (transposed view)
+  using LayoutB = cutlass::layout::ColumnMajor;  // B: column-major
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
   using GmemTiledCopyA = void;  // Auto-select
   using GmemTiledCopyB = void;  // Auto-select
 
-  // Tile configuration from mhc_guide.md: M=64, N=32, K=128
   using TileShape = Shape<_64, _32, _128>;
 
-  // TiledMMA: 8x2 subgroups (16 total), XE DPAS with mixed precision (bf16 × fp32 → fp32)
-  // For TileShape<64, 32, 128>: DPAS atom is 8x16x8, so we need 8 SGs in M, 2 SGs in N
-  // For mixed types, we use the wider type (float) for the MMA
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, cutlass::bfloat16_t>>,
       Layout<TileShape>,
@@ -106,6 +115,7 @@ void hc_pre_gemm(
   using GEMMDispatchPolicy = cutlass::gemm::MainloopXeL1Staged<PipelineStages>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGeneric;
 
+  // Use standard epilogue operation (no custom fusion)
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
       ElementOutput,
       ElementComputeEpilogue,
@@ -215,9 +225,44 @@ void hc_pre_gemm(
   status = gemm_op.initialize(arguments, workspace_size > 0 ? workspace.data_ptr() : nullptr);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "GEMM initialization failed");
 
-  // Run
+  // Run GEMM
   status = gemm_op.run();
   TORCH_CHECK(status == cutlass::Status::kSuccess, "GEMM execution failed");
+
+  // Compute sqrsum: sqrsum[t] = sum(C[t, :]^2) for each row
+  auto queue = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
+
+  const int BLOCK_SIZE = 256;
+  int num_groups = M;
+
+  // Extract raw pointers (device copyable)
+  float* C_ptr = C.data_ptr<float>();
+  float* sqrsum_ptr = sqrsum.data_ptr<float>();
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<class hc_pre_gemm_sqrsum_kernel>(
+        sycl::nd_range<1>(num_groups * BLOCK_SIZE, BLOCK_SIZE),
+        [=](sycl::nd_item<1> item) {
+          int row = item.get_group(0);
+          int tid = item.get_local_id(0);
+
+          float local_sum = 0.0f;
+
+          // Each thread processes some columns
+          for (int col = tid; col < N_val; col += BLOCK_SIZE) {
+            float val = C_ptr[row * N_val + col];
+            local_sum += val * val;
+          }
+
+          // Reduce within work-group
+          local_sum = sycl::reduce_over_group(item.get_group(), local_sum, sycl::plus<float>());
+
+          // Write result
+          if (tid == 0) {
+            sqrsum_ptr[row] = local_sum;
+          }
+        });
+  });
 
   // Synchronize
   c10::xpu::syncStreamsOnDevice(A.device().index());
